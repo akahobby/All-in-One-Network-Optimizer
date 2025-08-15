@@ -171,40 +171,60 @@ function Get-ProviderForTemplate([string]$Template){
   return [pscustomobject]@{ Name = $null; Id = $null }
 }
 
+# >>> UPDATED: verified read-back printed like netsh output
 function Show-ProviderSummary([string[]]$templates, [string]$AssumeNameIfNumeric){
   $loop = (netsh int ipv4 show global | Select-String -Pattern 'Loopback Large MTU').ToString()
   $loopVal = ($loop -replace '.*:\s*','').Trim()
-  Write-Host "    Loopback Large MTU: $loopVal"
+  Write-Host ""
+  Write-Host "Verified settings (read-back):" -ForegroundColor Cyan
+  Write-Host ("    Loopback Large MTU : {0}" -f $loopVal)
+
   foreach($t in $templates){
-    $p = Get-ProviderForTemplate $t
-    $display = if ($p.Name) {
-      $p.Name
-    } elseif ($AssumeNameIfNumeric -and $p.Id) {
-      "$AssumeNameIfNumeric (id $($p.Id))"
-    } elseif ($p.Id) {
-      "id $($p.Id)"
+    $txt  = (netsh int tcp show supplemental $t) -join "`n"
+    $line = ($txt -split "`r?`n" | Where-Object { $_ -match '(?i)^\s*Congestion Control Provider\s*:' } | Select-Object -First 1)
+    if ($line) {
+      $val = ($line -replace '.*:\s*','').Trim()
+      if ($val -match '^[0-9]+$') {
+        $name = $KnownIdMap[$val]
+        if ($name) { $val = "$name (id $val)" } else { $val = "id $val" }
+      }
+      Write-Host ("    {0,-16} => {1}" -f $t, $val)
     } else {
-      '(unknown)'
+      $p = Get-ProviderForTemplate $t
+      $display = if ($p.Name) {
+        $p.Name
+      } elseif ($AssumeNameIfNumeric -and $p.Id) {
+        "$AssumeNameIfNumeric (id $($p.Id))"
+      } elseif ($p.Id) {
+        "id $($p.Id)"
+      } else {
+        '(unknown)'
+      }
+      Write-Host ("    {0,-16} => {1}" -f $t, $display)
     }
-    Write-Host ("    {0,-16} => {1}" -f $t, $display)
   }
 }
 
-function Print-CompatHowTo {
+function Print-CompatHowToAll($desired){
   Write-Host ""
-  Write-Host "How to switch the 'compat' template manually (if your build allows):" -ForegroundColor Yellow
-  Write-Host "  1) Open an **elevated** Command Prompt (Run as Administrator)."
-  Write-Host "  2) Run ONE of these lines:"
-  Write-Host "       netsh int tcp set supplemental compat congestionprovider=bbr2"
-  Write-Host "       netsh int tcp set supplemental compat congestionprovider=cubic"
-  Write-Host "       netsh int tcp set supplemental compat congestionprovider=newreno"
-  Write-Host "  3) Verify:"
-  Write-Host "       netsh int tcp show supplemental compat"
-  Write-Host "  Note: On many Windows builds, 'compat' is intentionally fixed to NewReno."
-  Write-Host "        If it still shows NewReno after the command and a reboot, your OS locks it."
+  Write-Host "How to switch ALL templates manually (if your build allows):" -ForegroundColor Yellow
+  if ($desired -eq 'bbr2') {
+    Write-Host "  netsh int ipv4 set gl loopbacklargemtu=disabled"
+  } else {
+    Write-Host "  netsh int ipv4 set gl loopbacklargemtu=enabled"
+  }
+  foreach($t in @('internet','internetcustom','datacenter','datacentercustom','compat')){
+    Write-Host ("  netsh int tcp set supplemental {0} congestionprovider={1}" -f $t, $desired)
+  }
+  Write-Host ""
+  Write-Host "Verify after running:"
+  Write-Host "  netsh int tcp show supplemental internet"
+  Write-Host "  netsh int tcp show supplemental compat"
+  Write-Host "Note: Some Windows builds intentionally lock 'compat' (often to NewReno)."
   Write-Host ""
 }
 
+# >>> UPDATED: force all templates to chosen provider
 function Set-Congestion([string]$Provider){
   $prov = $Provider.ToLower()
   $desired = switch ($prov) {
@@ -226,47 +246,42 @@ function Set-Congestion([string]$Provider){
   $nowLoop = ($g2 -replace '.*:\s*','').Trim()
   Write-Host "    Loopback Large MTU now $nowLoop."
 
-  # Providers
   $templates = @('internet','internetcustom','datacenter','datacentercustom','compat')
+
   foreach($t in $templates){
-    $cur = Get-ProviderForTemplate $t
-    $curName = if ($cur.Name) { $cur.Name } elseif ($cur.Id -and $KnownIdMap[$cur.Id]) { $KnownIdMap[$cur.Id] } else { $null }
-
-    if ($curName -and ($curName -ieq $desired)) {
-      Write-Host "[=] $t congestion provider already -> $desired"
-      continue
-    }
-
-    $out = & netsh int tcp set supplemental $t "congestionprovider=$desired" 2>&1
-    if ($LASTEXITCODE -eq 0 -or ($out -match 'Ok\.')) {
-      # Re-read to verify
+    $ok = $false
+    for($attempt=1; $attempt -le 2 -and -not $ok; $attempt++){
+      $out = & netsh int tcp set supplemental $t "congestionprovider=$desired" 2>&1
+      Start-Sleep -Milliseconds 150
       $after = Get-ProviderForTemplate $t
       $afterName = if ($after.Name) { $after.Name } elseif ($after.Id -and $KnownIdMap[$after.Id]) { $KnownIdMap[$after.Id] } else { $null }
-      $afterText = _IfEmpty $afterName 'unknown'
-
       if ($afterName -and ($afterName -ieq $desired)) {
+        if ($attempt -eq 1) { Write-Change "Congestion($t): -> $desired" }
         Write-Host "[+] $t congestion provider -> $desired"
-        Write-Change "Congestion($t): $curName -> $desired"
+        $ok = $true
       } else {
-        if ($t -eq 'compat') {
-          Write-Host "[~] '$t' appears locked by the OS (stayed '$afterText'). Leaving it as-is."
-          Write-Change "Congestion($t): attempted '$desired' but OS kept '$afterText'"
-        } else {
-          Write-Host "[!] $t did not reflect the change (now '$afterText')."
-          Write-Change "Congestion($t): set attempted '$desired' but read-back '$afterText'"
+        if ($attempt -eq 1) {
+          $txt = if([string]::IsNullOrEmpty($afterName)){'unknown'} else {$afterName}
+          Write-Host "[!] $t did not reflect the change (now '$txt'). Retrying..."
         }
       }
-    } else {
-      Write-Host "[!] Failed setting $t to $desired"
-      if ($out){ Write-Host $out }
+    }
+    if (-not $ok) {
+      $final = Get-ProviderForTemplate $t
+      $finalName = if ($final.Name) { $final.Name } elseif ($final.Id -and $KnownIdMap[$final.Id]) { $KnownIdMap[$final.Id] } else { $null }
+      $finalText = if([string]::IsNullOrEmpty($finalName)){'unknown'} else {$finalName}
+      if ($t -eq 'compat') {
+        Write-Host "[~] '$t' appears locked by the OS (stayed '$finalText'). Leaving it as-is."
+        Write-Change "Congestion($t): attempted '$desired' but OS kept '$finalText'"
+      } else {
+        Write-Host "[!] $t stayed '$finalText' after retry."
+        Write-Change "Congestion($t): failed to set '$desired' (now '$finalText')"
+      }
     }
   }
 
-  # Final summary with friendly names (or IDs if that’s all the OS exposes)
   Show-ProviderSummary -templates $templates -AssumeNameIfNumeric $desired
-
-  # Always show compat how-to, regardless of current value
-  Print-CompatHowTo
+  Print-CompatHowToAll -desired $desired
 }
 
 # ---- Power Management (uncheck all 3) ----
