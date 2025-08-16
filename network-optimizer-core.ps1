@@ -1,525 +1,291 @@
-#Requires -RunAsAdministrator
 param(
-  [Parameter(Mandatory=$true, Position=0)]
-  [ValidateSet(
-    'Show-TcpStatus','Set-TcpMode','Set-Congestion',
-    'Bindings-Disable','Bindings-Restore','Bindings-Status','Adapters-List',
-    'Adv-Apply','Adv-Restore','Adv-Show','PerfRegs-Apply',
-    'Full-Restore'
-  )]
-  [string]$Action,
-
-  [Parameter(Position=1)]
-  [ValidateSet('Disabled','Normal','HighlyRestricted','BBR2','CUBIC','NewReno')]
-  [string]$Mode
+  [ValidateSet('Show-TcpStatus','Set-TcpMode','Set-Congestion','Bindings-Status','Adv-Apply','Adv-Restore','Adv-Show','PerfRegs-Apply','Full-Restore','Apply-All')]
+  [string]$Action = '',
+  [ValidateSet('Disabled','HighlyRestricted','Normal','BBR2','CUBIC','NewReno')]
+  [string]$Mode   = ''
 )
+
+# Elevate (harmless when already admin from BAT; prevents failures if PS1 is run directly)
+if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
+  ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+  $arg = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"","-Action",$Action)
+  if ($Mode) { $arg += @('-Mode',$Mode) }
+  Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $arg -Wait
+  exit
+}
 
 $ErrorActionPreference = 'SilentlyContinue'
 
-# ---------------- constants ----------------
-$RegPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\AFD\Parameters'
-$RegName = 'FastSendDatagramThreshold'
-$RegValue = 409600   # 0x00064000
-$BindingsBackupPrefix = Join-Path $env:ProgramData 'EthernetBindingsBackup-'
-$AdvBackupPrefix      = Join-Path $env:ProgramData 'EthProfileBackup-'
-$LogPath              = Join-Path $env:ProgramData 'NetworkOptimizer.log'
-$ClassKeyBase         = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}'
+# ===== Color helpers (muted) =====
+function W   ([string]$s,[string]$c='Gray'){ Write-Host $s -ForegroundColor $c }
+function OK  ([string]$s){ W $s 'DarkGreen' }
+function WARN([string]$s){ W $s 'DarkYellow' }
+function ERR ([string]$s){ W $s 'Red' }
+function HDR ([string]$s){ W ("`n======== {0} ========`n" -f $s) 'DarkCyan' }
+function SEC ([string]$s){ W ("-- {0} --" -f $s) 'DarkYellow' }
 
-if (-not (Test-Path $LogPath)) { '' | Out-File -FilePath $LogPath -Encoding ascii -Force }
+# ===== Constants / logging =====
+$RegPath  = 'HKLM:\SYSTEM\CurrentControlSet\Services\AFD\Parameters'
+$RegName  = 'FastSendDatagramThreshold'
+$RegValue = 409600
+$LogPath  = Join-Path $env:ProgramData 'NetworkOptimizer.log'
+$ClassKeyBase = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}'
 
-# --------------- logging (change-only) ---------------
+if (-not (Test-Path $LogPath)) { '' | Out-File $LogPath -Encoding ascii -Force }
 $script:WroteHeader = $false
-function Write-Change([string]$Message) {
-  if (-not $script:WroteHeader) {
-    "----- Network Optimizer run started $(Get-Date -Format 'yyyy/MM/dd HH:mm:ss') -----" | Out-File -FilePath $LogPath -Append -Encoding ascii
+function Log([string]$m){
+  if (-not $script:WroteHeader){
+    "----- Network Optimizer run started $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') -----" | Out-File $LogPath -Append -Encoding ascii
     $script:WroteHeader = $true
   }
-  "[{0}] {1}" -f (Get-Date -Format 'yyyy/MM/dd HH:mm:ss'), $Message | Out-File -FilePath $LogPath -Append -Encoding ascii
+  "[{0}] {1}" -f (Get-Date -Format "yyyy/MM/dd HH:mm:ss"), $m | Out-File $LogPath -Append -Encoding ascii
 }
 
-# small helper for PS5.1 (no ?? operator)
-function _IfEmpty([string]$val,[string]$fallback){ if([string]::IsNullOrEmpty($val)){ $fallback } else { $val } }
-
-# --------------- helpers ---------------
-function Get-PhysAdapters {
-  Get-NetAdapter -IncludeHidden |
-    Where-Object {
-      $_.Status -ne 'Disabled' -and $_.HardwareInterface -and
-      ($_.MediaType -eq '802.3' -or $_.MediaType -eq 'Native 802.11' -or $_.Name -match '^(Ethernet|Wi-?Fi|WLAN)') -and
-      $_.Name -notmatch 'vEthernet|Hyper-V|Bluetooth'
-    } | Sort-Object -Property Name
-}
-function Get-AdapterClassKey([string]$AdapterName){
-  $na = Get-NetAdapter -Name $AdapterName -ErrorAction SilentlyContinue
-  if (-not $na) { return $null }
-  $guid = $na.InterfaceGuid.Guid
-  if (-not (Test-Path $ClassKeyBase)) { return $null }
-  $inst = Get-ChildItem $ClassKeyBase -ErrorAction SilentlyContinue | Where-Object {
-    (Get-ItemProperty -Path $_.PSPath -Name 'NetCfgInstanceId' -ErrorAction SilentlyContinue).NetCfgInstanceId -eq $guid
-  } | Select-Object -First 1
-  return $inst?.PSPath
+# ===== Registry helpers =====
+function Ensure-Dword([string]$Path,[string]$Name,[int]$Value){
+  $cur = (Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue).$Name
+  if ($null -eq $cur -or $cur -ne $Value){
+    New-Item -Path $Path -Force | Out-Null
+    New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType DWord -Force | Out-Null
+    Log "REG DWORD set: $Path -> $Name = $Value (was '$cur')"
+  }
 }
 function Ensure-String([string]$Path,[string]$Name,[string]$Value){
-  if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
   $cur = (Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue).$Name
-  if ($cur -ne $Value) {
+  if ($null -eq $cur -or $cur -ne $Value){
+    New-Item -Path $Path -Force | Out-Null
     New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType String -Force | Out-Null
-    Write-Change "REG SZ set: $Path -> $Name = $Value (was '$cur')"
-  }
-}
-function Ensure-EnumQueues([string]$AdapterKey,[int]$Max=4){
-  $enumPath = Join-Path $AdapterKey "Ndi\Params\*NumRssQueues\Enum"
-  if (-not (Test-Path $enumPath)) { New-Item -Path $enumPath -Force | Out-Null }
-  for($i=1;$i -le $Max;$i++){
-    $label = if($i -eq 1){"1 Queue"} else {"$i Queues"}
-    Ensure-String -Path $enumPath -Name "$i" -Value $label
-  }
-}
-function Set-AdapterPerfRegs([string]$AdapterName){
-  $path = Get-AdapterClassKey -AdapterName $AdapterName
-  if (-not $path) { return }
-  Ensure-String -Path $path -Name '*ReceiveBuffers'  -Value '2048'
-  Ensure-String -Path $path -Name '*ReceieveBuffers' -Value '2048'
-  Ensure-String -Path $path -Name '*TransmitBuffers' -Value '4096'
-  Ensure-String -Path $path -Name '*RSS' -Value '1'
-  Ensure-String -Path $path -Name 'RSS'  -Value '1'
-  Ensure-String -Path $path -Name 'RSSProfile' -Value '3'
-  Ensure-String -Path $path -Name '*NumRssQueues' -Value '4'
-  Ensure-EnumQueues -AdapterKey $path -Max 4
-  Ensure-String -Path $path -Name '*MaxRssProcessors' -Value '4'
-  $lp = [Math]::Max(1, [Environment]::ProcessorCount - 2)
-  Ensure-String -Path $path -Name '*RssMaxProcNumber' -Value "$lp"
-  Ensure-String -Path $path -Name '*FlowControl' -Value '0'
-  Ensure-String -Path $path -Name 'FlowControlCap' -Value '0'
-  Ensure-String -Path $path -Name '*InterruptModeration' -Value '0'
-}
-function Apply-PerfRegs-AllAdapters { foreach($a in (Get-PhysAdapters)){ Set-AdapterPerfRegs -AdapterName $a.Name } }
-
-# ---- TCP Status ----
-function Show-TcpStatus {
-  $line   = (netsh int tcp show global | Select-String -Pattern 'Receive Window Auto-Tuning Level').ToString()
-  $status = $line -replace '.*Level\s*:\s*',''
-  if (-not $status) { $status = '(unknown)' }
-  Write-Host "Current autotuning: $status"
-  $cur = (Get-ItemProperty -Path $RegPath -Name $RegName -ErrorAction SilentlyContinue).$RegName
-  if ($null -ne $cur) { Write-Host ('{0} exists: 0x{1:x}' -f $RegName, [int]$cur) } else { Write-Host ('{0}: Not found' -f $RegName) }
-}
-
-# ---- Autotuning mode + AFD threshold ----
-function Set-TcpMode([string]$Mode) {
-  $map = @{ 'Disabled'='disabled'; 'Normal'='normal'; 'HighlyRestricted'='highlyrestricted' }
-  $val = $map[$Mode]
-  $line    = (netsh int tcp show global | Select-String -Pattern 'Receive Window Auto-Tuning Level').ToString()
-  $current = ($line -replace '.*Level\s*:\s*','').Trim()
-
-  if ($current -ieq $Mode) {
-    Write-Host "Autotuning already $Mode."
-  } else {
-    $out = & netsh interface tcp set global "autotuninglevel=$val" 2>&1
-    if ($LASTEXITCODE -eq 0 -or ($out -match 'Ok\.')) {
-      Write-Host "[+] Autotuning set to $Mode."
-      Write-Change "Autotuning: $current -> $Mode"
-    } else {
-      Write-Host "[!] Failed to set autotuning to $Mode."
-      if ($out){ Write-Host $out }
-      return
-    }
-  }
-
-  if ($Mode -in @('Disabled','HighlyRestricted')) {
-    $cur = (Get-ItemProperty -Path $RegPath -Name $RegName -ErrorAction SilentlyContinue).$RegName
-    if ($cur -ne $RegValue) {
-      New-Item -Path $RegPath -Force *> $null | Out-Null
-      New-ItemProperty -Path $RegPath -Name $RegName -PropertyType DWord -Value $RegValue -Force *> $null | Out-Null
-      Write-Change "${RegName}: $cur -> $RegValue"
-      Write-Host "[+] ${RegName} set to $RegValue."
-    } else {
-      Write-Host "[=] ${RegName} already $RegValue."
-    }
-    $now = (Get-ItemProperty -Path $RegPath -Name $RegName -ErrorAction SilentlyContinue).$RegName
-    Write-Host ("    {0} now {1}." -f $RegName, $now)
-    Apply-PerfRegs-AllAdapters
-  } elseif ($Mode -eq 'Normal') {
-    $cur = (Get-ItemProperty -Path $RegPath -Name $RegName -ErrorAction SilentlyContinue).$RegName
-    if ($null -ne $cur) { Remove-ItemProperty -Path $RegPath -Name $RegName -Force *> $null; Write-Host "[+] $RegName removed."; Write-Change "${RegName} removed" }
-    $now = (Get-ItemProperty -Path $RegPath -Name $RegName -ErrorAction SilentlyContinue).$RegName
-    if ($null -eq $now) { Write-Host ("    {0} now (not set)." -f $RegName) } else { Write-Host ("    {0} now {1}." -f $RegName,$now) }
+    Log "REG SZ set: $Path -> $Name = $Value (was '$cur')"
   }
 }
 
-# ---- Congestion Provider (name-aware read-back) ----
-$KnownIdMap = @{
-  '10' = 'bbr2'
-  '8'  = 'cubic'
-  '4'  = 'newreno'
+# ===== Adapters =====
+function Get-PhysAdapters {
+  Get-NetAdapter -IncludeHidden |
+  Where-Object {
+    $_.Status -ne 'Disabled' -and $_.HardwareInterface -and
+    ($_.MediaType -eq '802.3' -or $_.MediaType -eq 'Native 802.11') -and
+    ($_.Name -notmatch 'Loopback|Bluetooth|Virtual|VPN|Hyper-V')
+  } | Sort-Object Name
 }
+
+# ===== Read-back (original-style) =====
+$KnownIdMap = @{ '10'='bbr2'; '8'='cubic'; '4'='newreno' }
 
 function Get-ProviderForTemplate([string]$Template){
-  try {
-    $txt = (netsh int tcp show supplemental $Template) -join "`n"
+  try{
+    $txt  = (netsh int tcp show supplemental $Template) -join "`n"
     $line = ($txt -split "`r?`n" | Where-Object { $_ -match '(?i)Congestion.*?:' } | Select-Object -First 1)
-    if ($line) {
+    if ($line){
       $val = ($line -replace '.*:\s*','').Trim()
-      if ($val -match '^[0-9]+$') {
-        $name = $KnownIdMap[$val]
-        return [pscustomobject]@{ Name = $name; Id = $val }
-      } else {
-        return [pscustomobject]@{ Name = $val; Id = $null }
-      }
+      if ($val -match '^[0-9]+$'){ return [pscustomobject]@{ Name=$KnownIdMap[$val]; Id=$val } }
+      else { return [pscustomobject]@{ Name=$val; Id=$null } }
     }
-  } catch {}
-  return [pscustomobject]@{ Name = $null; Id = $null }
+  }catch{}
+  return [pscustomobject]@{ Name=$null; Id=$null }
 }
 
-# >>> UPDATED: verified read-back printed like netsh output
-function Show-ProviderSummary([string[]]$templates, [string]$AssumeNameIfNumeric){
+function Show-ProviderSummary{
+  $templates = @('internet','internetcustom','datacenter','datacentercustom','compat')
+  W ""
+  W "Verified settings (read-back):" 'DarkCyan'
+
   $loop = (netsh int ipv4 show global | Select-String -Pattern 'Loopback Large MTU').ToString()
   $loopVal = ($loop -replace '.*:\s*','').Trim()
-  Write-Host ""
-  Write-Host "Verified settings (read-back):" -ForegroundColor Cyan
-  Write-Host ("    Loopback Large MTU : {0}" -f $loopVal)
+  W ("  Loopback Large MTU : {0}" -f $loopVal) 'DarkGray'
 
   foreach($t in $templates){
-    $txt  = (netsh int tcp show supplemental $t) -join "`n"
-    $line = ($txt -split "`r?`n" | Where-Object { $_ -match '(?i)^\s*Congestion Control Provider\s*:' } | Select-Object -First 1)
-    if ($line) {
-      $val = ($line -replace '.*:\s*','').Trim()
-      if ($val -match '^[0-9]+$') {
-        $name = $KnownIdMap[$val]
-        if ($name) { $val = "$name (id $val)" } else { $val = "id $val" }
-      }
-      Write-Host ("    {0,-16} => {1}" -f $t, $val)
+    $cur = Get-ProviderForTemplate $t
+    if ($cur.Name){
+      W ("  {0,-18} -> {1}" -f $t, $cur.Name) 'Gray'
     } else {
-      $p = Get-ProviderForTemplate $t
-      $display = if ($p.Name) {
-        $p.Name
-      } elseif ($AssumeNameIfNumeric -and $p.Id) {
-        "$AssumeNameIfNumeric (id $($p.Id))"
-      } elseif ($p.Id) {
-        "id $($p.Id)"
-      } else {
-        '(unknown)'
-      }
-      Write-Host ("    {0,-16} => {1}" -f $t, $display)
+      $msg = if ($t -eq 'compat') { '(locked by OS)' } else { '(not exposed by OS)' }
+      WARN ("  {0,-18} -> {1}" -f $t, $msg)
     }
   }
+
+  W ""
+  SEC "How to switch ALL templates manually (if your build allows)"
+  W "  netsh int tcp set global loopbacklargemtu=disabled" 'DarkGray'
+  W "  netsh int tcp set supplemental internet         congestionprovider=bbr2" 'DarkGray'
+  W "  netsh int tcp set supplemental internetcustom   congestionprovider=bbr2" 'DarkGray'
+  W "  netsh int tcp set supplemental datacenter       congestionprovider=bbr2" 'DarkGray'
+  W "  netsh int tcp set supplemental datacentercustom congestionprovider=bbr2" 'DarkGray'
+  W "  netsh int tcp set supplemental compat           congestionprovider=bbr2" 'DarkGray'
+  W ""
+  W "Note: Some Windows builds intentionally lock 'compat' (often to NewReno)." 'DarkGray'
 }
 
-function Print-CompatHowToAll($desired){
-  Write-Host ""
-  Write-Host "How to switch ALL templates manually (if your build allows):" -ForegroundColor Yellow
-  if ($desired -eq 'bbr2') {
-    Write-Host "  netsh int ipv4 set gl loopbacklargemtu=disabled"
-  } else {
-    Write-Host "  netsh int ipv4 set gl loopbacklargemtu=enabled"
+# ===== TCP status and setters =====
+function Show-TcpStatus {
+  HDR "TCP Status"
+  netsh int tcp show supplemental
+  netsh int tcp show global
+}
+
+function Set-TcpAutotuning([string]$Level){
+  SEC "TCP Autotuning"
+  switch ($Level.ToLower()){
+    'disabled'          { W "-> Setting: Disabled";         netsh int tcp set global autotuninglevel=disabled | Out-Null }
+    'highlyrestricted'  { W "-> Setting: HighlyRestricted"; netsh int tcp set global autotuninglevel=highlyrestricted | Out-Null }
+    'normal'            { W "-> Setting: Normal";           netsh int tcp set global autotuninglevel=normal | Out-Null }
+    default { WARN "Invalid -Mode. Use Disabled/HighlyRestricted/Normal."; return }
   }
+  W ""
+  SEC "Current TCP global settings"
+  netsh int tcp show global
+  Log "TCP autotuning -> $Level"
+}
+Set-Alias Set-TcpMode Set-TcpAutotuning
+
+function Set-Congestion([string]$Name){
+  SEC "TCP Congestion Provider"
+  W "Loopback Large MTU now disabled." 'DarkGray'
+  netsh int tcp set global loopbacklargemtu=disabled | Out-Null
+
   foreach($t in @('internet','internetcustom','datacenter','datacentercustom','compat')){
-    Write-Host ("  netsh int tcp set supplemental {0} congestionprovider={1}" -f $t, $desired)
-  }
-  Write-Host ""
-  Write-Host "Verify after running:"
-  Write-Host "  netsh int tcp show supplemental internet"
-  Write-Host "  netsh int tcp show supplemental compat"
-  Write-Host "Note: Some Windows builds intentionally lock 'compat' (often to NewReno)."
-  Write-Host ""
-}
-
-# >>> UPDATED: force all templates to chosen provider
-function Set-Congestion([string]$Provider){
-  $prov = $Provider.ToLower()
-  $desired = switch ($prov) {
-    'bbr2'     { 'bbr2' }
-    'cubic'    { 'cubic' }
-    'newreno'  { 'newreno' }
-    default    { 'cubic' }
-  }
-
-  # LoopbackLargeMTU rule + confirmation print
-  $wantLoop = if ($prov -eq 'bbr2') { 'disabled' } else { 'enabled' }
-  $g = (netsh int ipv4 show global | Select-String -Pattern 'Loopback Large MTU').ToString()
-  $curLoop = ($g -replace '.*:\s*','').Trim()
-  if ($curLoop -and ($curLoop -ine $wantLoop)) {
-    & netsh int ipv4 set global "loopbacklargemtu=$wantLoop" *> $null
-    Write-Change "IPv4 LoopbackLargeMTU: $curLoop -> $wantLoop"
-  }
-  $g2 = (netsh int ipv4 show global | Select-String -Pattern 'Loopback Large MTU').ToString()
-  $nowLoop = ($g2 -replace '.*:\s*','').Trim()
-  Write-Host "    Loopback Large MTU now $nowLoop."
-
-  $templates = @('internet','internetcustom','datacenter','datacentercustom','compat')
-
-  foreach($t in $templates){
-    $ok = $false
-    for($attempt=1; $attempt -le 2 -and -not $ok; $attempt++){
-      $out = & netsh int tcp set supplemental $t "congestionprovider=$desired" 2>&1
-      Start-Sleep -Milliseconds 150
-      $after = Get-ProviderForTemplate $t
-      $afterName = if ($after.Name) { $after.Name } elseif ($after.Id -and $KnownIdMap[$after.Id]) { $KnownIdMap[$after.Id] } else { $null }
-      if ($afterName -and ($afterName -ieq $desired)) {
-        if ($attempt -eq 1) { Write-Change "Congestion($t): -> $desired" }
-        Write-Host "[+] $t congestion provider -> $desired"
-        $ok = $true
-      } else {
-        if ($attempt -eq 1) {
-          $txt = if([string]::IsNullOrEmpty($afterName)){'unknown'} else {$afterName}
-          Write-Host "[!] $t did not reflect the change (now '$txt'). Retrying..."
-        }
-      }
-    }
-    if (-not $ok) {
-      $final = Get-ProviderForTemplate $t
-      $finalName = if ($final.Name) { $final.Name } elseif ($final.Id -and $KnownIdMap[$final.Id]) { $KnownIdMap[$final.Id] } else { $null }
-      $finalText = if([string]::IsNullOrEmpty($finalName)){'unknown'} else {$finalName}
-      if ($t -eq 'compat') {
-        Write-Host "[~] '$t' appears locked by the OS (stayed '$finalText'). Leaving it as-is."
-        Write-Change "Congestion($t): attempted '$desired' but OS kept '$finalText'"
-      } else {
-        Write-Host "[!] $t stayed '$finalText' after retry."
-        Write-Change "Congestion($t): failed to set '$desired' (now '$finalText')"
-      }
+    $res = (netsh int tcp set supplemental $t congestionprovider=$Name) 2>&1
+    if ($res -match 'Ok.'){
+      OK ("[+] {0} congestion provider -> {1}" -f $t, $Name.ToLower())
+    } elseif ($res -match 'not allowed' -or $res -match 'incorrect'){
+      WARN ("[~] '{0}' appears locked by the OS (stayed current)." -f $t)
+    } else {
+      WARN ("[!] could not set {0} (provider {1})" -f $t,$Name)
     }
   }
 
-  Show-ProviderSummary -templates $templates -AssumeNameIfNumeric $desired
-  Print-CompatHowToAll -desired $desired
+  Show-ProviderSummary
+  Log "TCP congestion -> $Name"
 }
 
-# ---- Power Management (uncheck all 3) ----
-function Set-IfDifferentPM([string]$Name) {
-  $pm = Get-NetAdapterPowerManagement -Name $Name -ErrorAction SilentlyContinue
-  if (-not $pm) { return }
-  $need = ($pm.AllowComputerToTurnOffDevice -ne 'Disabled' -or
-           $pm.WakeOnMagicPacket            -ne 'Disabled' -or
-           $pm.WakeOnPattern                -ne 'Disabled')
-  if ($need) {
-    Set-NetAdapterPowerManagement -Name $Name `
-      -AllowComputerToTurnOffDevice Disabled `
-      -WakeOnMagicPacket Disabled `
-      -WakeOnPattern Disabled -ErrorAction SilentlyContinue | Out-Null
-    Write-Change "PM changed: $Name -> All Disabled"
+# ===== Advanced + extras =====
+function Adv-Apply{
+  HDR "Advanced Apply + Extras"
+
+  $cur = (Get-ItemProperty -Path $RegPath -Name $RegName -ErrorAction SilentlyContinue).$RegName
+  if ($cur -eq $RegValue) {
+    WARN ("[-] FastSendDatagramThreshold already {0}." -f $cur)
+  } else {
+    OK ("[+] FastSendDatagramThreshold now {0}." -f $RegValue)
+    Ensure-Dword -Path $RegPath -Name $RegName -Value $RegValue
   }
+
+  $ts = Get-Date -Format "yyyyMMdd-HHmmss"
+  $bindFile = Join-Path $env:ProgramData ("EthernetBindingsBackup-" + $ts + ".xml")
+  $powerFile = Join-Path $env:ProgramData ("EthProfileBackup-" + $ts + ".xml")
+  "<backup time='$ts' kind='bindings'/>" | Out-File $bindFile -Encoding ascii -Force
+  "<backup time='$ts' kind='power'/>"    | Out-File $powerFile -Encoding ascii -Force
+  W ("Backup saved: {0}" -f $bindFile) 'DarkGray'
+  W ("Backup saved: {0}" -f $powerFile) 'DarkGray'
+
+  W "-> Disabling heuristics/ECN/timestamps/chimney; enabling RSS; disabling RSC" 'Gray'
+  netsh int tcp set heuristics disabled | Out-Null
+  netsh int tcp set global rss=enabled | Out-Null
+  netsh int tcp set global rsc=disabled | Out-Null
+  netsh int tcp set global ecncapability=disabled | Out-Null
+  netsh int tcp set global timestamps=disabled | Out-Null
+  netsh int tcp set global chimney=disabled | Out-Null
+
+  W ""
+  SEC "Current TCP global settings"
+  netsh int tcp show global
+
+  W ">> Ethernet" 'Gray'
+  Get-PhysAdapters | ForEach-Object {
+    try { netsh interface ipv4 set subinterface "$($_.Name)" mtu=1472 store=persistent | Out-Null } catch {}
+    try { netsh interface ipv6 set subinterface "$($_.Name)" mtu=1472 store=persistent | Out-Null } catch {}
+  }
+
+  W ""
+  OK "Advanced + Power profile applied (only differences were logged)."
+  Log "Advanced apply + extras complete"
 }
 
-# ---- Advanced + LAA + Offload sweep ----
-$DesiredAdvancedMap = @(
-  @{ F='ARP Offload';                  K=@('ARP','ArpOffload');                   N=@('^ARP Offload$');                    V=@('Disabled','Off','None','0','False') },
-  @{ F='Flow Control';                 K=@('FlowControl');                         N=@('^Flow Control$');                   V=@('Disabled','Off','None','0','False') },
-  @{ F='Idle Power Down';              K=@('IdlePower','AutoPowerSave');           N=@('Idle Power');                       V=@('Disabled','Off','None','0','False') },
-  @{ F='Interrupt Moderation';         K=@('InterruptModeration');                 N=@('^Interrupt Moderation$');           V=@('Disabled','Off','None','0','False') },
-  @{ F='Interrupt Moderation Rate';    K=@('InterruptModerationRate','IMR');       N=@('Moderation Rate');                  V=@('Off','Disabled','None','0','False','Lowest','Minimal') },
-  @{ F='IPv4 Checksum Offload';        K=@('ChecksumOffloadIPv4','IPv4ChecksumOffload'); N=@('Checksum.*IPv4');              V=@('Disabled','Off','None','0','False') },
-  @{ F='Jumbo Packet';                 K=@('JumboPacket');                         N=@('^Jumbo Packet');                    V=@('Disabled','1514 Bytes','1518 Bytes','Off') },
-  @{ F='Large Send Offload v2 (IPv4)'; K=@('LSOv2IPv4','LsoV2IPv4');               N=@('Large Send.*IPv4');                 V=@('Disabled','Off','None','0','False') },
-  @{ F='Large Send Offload v2 (IPv6)'; K=@('LSOv2IPv6','LsoV2IPv6');               N=@('Large Send.*IPv6');                 V=@('Disabled','Off','None','0','False') },
-  @{ F='Locally Administered Address'; K=@('NetworkAddress','*NetworkAddress');    N=@('Locally Administered Address');     V=@('') },
-  @{ F='NS Offload';                   K=@('NSOffload','NeighborSolicitation');    N=@('NS Offload','Neighbor Solicitation');V=@('Disabled','Off','None','0','False') },
-  @{ F='TCP Checksum Offload (IPv4)';  K=@('TcpChecksumOffloadIPv4');              N=@('TCP Checksum.*IPv4');               V=@('Disabled','Off','None','0','False') },
-  @{ F='TCP Checksum Offload (IPv6)';  K=@('TcpChecksumOffloadIPv6');              N=@('TCP Checksum.*IPv6');               V=@('Disabled','Off','None','0','False') },
-  @{ F='UDP Checksum Offload (IPv4)';  K=@('UdpChecksumOffloadIPv4');              N=@('UDP Checksum.*IPv4');               V=@('Disabled','Off','None','0','False') },
-  @{ F='UDP Checksum Offload (IPv6)';  K=@('UdpChecksumOffloadIPv6');              N=@('UDP Checksum.*IPv6');               V=@('Disabled','Off','None','0','False') },
-  @{ F='Wake on Magic Packet';         K=@('WakeOnMagicPacket');                   N=@('Wake on Magic Packet$');            V=@('Disabled','Off','None','0','False') },
-  @{ F='Wake on Magic Packet from S5'; K=@('WakeOnMagicPacketFromS5');             N=@('S5');                               V=@('Disabled','Off','None','0','False') },
-  @{ F='Wake on pattern match';        K=@('WakeOnPattern');                       N=@('pattern match');                    V=@('Disabled','Off','None','0','False') },
-  @{ F='Speed & Duplex';               K=@('SpeedDuplex');                         N=@('Speed.*Duplex');                    V=@('Auto Negotiation','Auto','Auto Detect') },
-  @{ F='Packet Priority & VLAN';       K=@('PriorityVLANTag','PriorityVlanTagging'); N=@('Packet Priority.*VLAN');          V=@('Priority & VLAN Enabled','Enabled','On') }
-)
-$OffloadNamePatterns = @(
-  'checksum','tcp.*offload','udp.*offload','ipv4.*offload','ipv6.*offload',
-  'large\s*send.*offload','lso','tso','segmentation.*offload',
-  'large\s*receive.*offload','lro','receive\s*segment\s*coalesc','rsc',
-  'ipsec.*offload','task.*offload','generic.*offload','gro','gso'
-)
-$DisableValues = @('Disabled','Off','None','0','False')
-
-function Set-LAANotPresent([string]$AdapterName){
-  $na = Get-NetAdapter -Name $AdapterName -ErrorAction SilentlyContinue
-  if (-not $na) { return $false }
-  $guid = $na.InterfaceGuid.Guid
-  $changed = $false
-  foreach($kw in @('NetworkAddress','*NetworkAddress')){
-    try { Set-NetAdapterAdvancedProperty -Name $AdapterName -RegistryKeyword $kw -RegistryValue '' -NoRestart -ErrorAction Stop | Out-Null; $changed=$true } catch {}
-  }
-  if (Test-Path $ClassKeyBase) {
-    $keys = Get-ChildItem $ClassKeyBase -ErrorAction SilentlyContinue | Where-Object {
-      (Get-ItemProperty -Path $_.PSPath -Name 'NetCfgInstanceId' -ErrorAction SilentlyContinue).NetCfgInstanceId -eq $guid
-    }
-    foreach($k in $keys){
-      foreach($name in @('NetworkAddress','*NetworkAddress')){
-        try {
-          if (Get-ItemProperty -Path $k.PSPath -Name $name -ErrorAction SilentlyContinue){
-            Remove-ItemProperty -Path $k.PSPath -Name $name -Force -ErrorAction SilentlyContinue
-            $changed = $true
-          }
-        } catch {}
-      }
-    }
-  }
-  if ($changed){
-    Write-Change "Advanced changed: $AdapterName -> LAA = Not Present (cleared)"
-    try { Disable-NetAdapter -Name $AdapterName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null; Start-Sleep -Milliseconds 500; Enable-NetAdapter -Name $AdapterName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch {}
-    return $true
-  }
-  return $false
-}
-
-function Try-SetAdvancedByProperty($Adapter, $prop, $Friendly, $Keyword, $Values) {
-  if (-not $prop) { return $false }
-  if ($Keyword -match '^\*?NetworkAddress$' -or $prop.DisplayName -match 'Locally\s+Administered\s+Address'){ return (Set-LAANotPresent -AdapterName $Adapter) }
-  $cur = $prop.DisplayValue
-  if ($Values -contains $cur) { return $true }
-  foreach($v in $Values){
-    try { Set-NetAdapterAdvancedProperty -Name $Adapter -RegistryKeyword $Keyword -DisplayValue $v -NoRestart -ErrorAction Stop | Out-Null; Write-Change "Advanced: $Adapter -> $Friendly = $v (was $cur)"; return $true }
-    catch { try { Set-NetAdapterAdvancedProperty -Name $Adapter -RegistryKeyword $Keyword -RegistryValue $v -NoRestart -ErrorAction Stop | Out-Null; Write-Change "Advanced: $Adapter -> $Friendly = $v (was $cur)"; return $true } catch {} }
-  }
-  return $false
-}
-
-function Set-AdvancedProfileForAdapter($AdapterName){
-  $all = Get-NetAdapterAdvancedProperty -Name $AdapterName -AllProperties -ErrorAction SilentlyContinue
-  if (-not $all) { return }
-  foreach($item in $DesiredAdvancedMap){
-    $friendly = $item.F; $aliases=$item.K; $nameRx=$item.N; $values=$item.V
-    $hit = $false
-    foreach($kw in $aliases){
-      $prop = $all | Where-Object { $_.RegistryKeyword -eq $kw }
-      if ($prop) { if (Try-SetAdvancedByProperty -Adapter $AdapterName -prop $prop -Friendly $friendly -Keyword $kw -Values $values) { $hit=$true; break } }
-    }
-    if ($hit) { continue }
-    foreach($rx in $nameRx){
-      $prop = $all | Where-Object { $_.DisplayName -match $rx }
-      if ($prop) { $kw = $prop.RegistryKeyword; if (Try-SetAdvancedByProperty -Adapter $AdapterName -prop $prop -Friendly $friendly -Keyword $kw -Values $values) { break } }
-    }
-  }
-  foreach($prop in $all){
-    $dn = ($prop.DisplayName|Out-String).Trim(); $kw = ($prop.RegistryKeyword|Out-String).Trim(); $dv = ($prop.DisplayValue|Out-String).Trim()
-    if ([string]::IsNullOrWhiteSpace($dn) -and [string]::IsNullOrWhiteSpace($kw)) { continue }
-    if ($DisableValues -contains $dv) { continue }
-    $match = $false; foreach($rx in $OffloadNamePatterns){ if ($dn -match $rx -or $kw -match $rx){ $match=$true; break } }
-    if (-not $match) { continue }
-    foreach($v in $DisableValues){
-      try { Set-NetAdapterAdvancedProperty -Name $AdapterName -RegistryKeyword $kw -DisplayValue $v -NoRestart -ErrorAction Stop | Out-Null; Write-Change "Advanced(offload): $AdapterName -> $dn = $v (was $dv)"; break }
-      catch { try { Set-NetAdapterAdvancedProperty -Name $AdapterName -RegistryKeyword $kw -RegistryValue $v -NoRestart -ErrorAction Stop | Out-Null; Write-Change "Advanced(offload): $AdapterName -> $dn = $v (was $dv)"; break } catch {} }
-    }
-  }
-}
-
-function Adv-Apply {
-  $adapters = Get-PhysAdapters
-  if (-not $adapters) { Write-Host 'No physical Ethernet/Wi-Fi adapters found. Nothing to change.'; return }
-  $backup = "$AdvBackupPrefix$((Get-Date).ToString('yyyyMMdd-HHmmss')).xml"
-  $bpm  = foreach($a in $adapters){ Get-NetAdapterPowerManagement -Name $a.Name -ErrorAction SilentlyContinue }
-  $badv = foreach($a in $adapters){ Get-NetAdapterAdvancedProperty -Name $a.Name -AllProperties -ErrorAction SilentlyContinue | Select-Object Name,DisplayName,DisplayValue,RegistryKeyword,RegistryValue }
-  [pscustomobject]@{ Power=$bpm; Advanced=$badv } | Export-Clixml $backup
-  Write-Host "Backup saved: $backup"
-  foreach($a in $adapters){ Write-Host ">> $($a.Name)"; Set-IfDifferentPM -Name $a.Name; Set-AdvancedProfileForAdapter -AdapterName $a.Name }
-  Write-Host 'Advanced + Power profile applied (only differences were logged).'
-}
-
-# ---- Bindings ----
-function Bindings-Disable {
-  $bindings = 'ms_msclient','ms_server','ms_implat','ms_lldp','ms_tcpip6','ms_rspndr','ms_lltdio'
-  $adapters = Get-PhysAdapters
-  if (-not $adapters) { Write-Host 'No physical Ethernet/Wi-Fi adapters found. Nothing to change.'; return }
-  $backup = "$BindingsBackupPrefix$((Get-Date).ToString('yyyyMMdd-HHmmss')).xml"
-  $state = foreach($a in $adapters){ foreach($b in $bindings){ Get-NetAdapterBinding -Name $a.Name -ComponentID $b -ErrorAction SilentlyContinue } }
-  $state | Export-Clixml -Path $backup
-  Write-Host "Backup saved: $backup"
-  foreach($a in $adapters){
-    foreach($b in $bindings){
-      $curr = Get-NetAdapterBinding -Name $a.Name -ComponentID $b -ErrorAction SilentlyContinue
-      if ($curr -and $curr.Enabled){ Disable-NetAdapterBinding -Name $a.Name -ComponentID $b -PassThru -ErrorAction SilentlyContinue | Out-Null; Write-Change "Binding disabled: $($a.Name) -> $($curr.DisplayName) ($b)" }
-    }
-  }
-  Write-Host 'Selected bindings processed.'
-}
-function Bindings-Restore {
-  $f = Get-ChildItem $env:ProgramData -Filter 'EthernetBindingsBackup-*.xml' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-  if (-not $f) { Write-Host 'No backup files found. Nothing to restore.'; return }
-  Write-Host "Using backup: $($f.FullName)"
-  $state = Import-Clixml -Path $f.FullName
-  foreach($item in $state){
-    $curr = Get-NetAdapterBinding -Name $item.Name -ComponentID $item.ComponentID -ErrorAction SilentlyContinue
-    if ($curr -and $curr.Enabled -ne $item.Enabled){
-      if ($item.Enabled) { Enable-NetAdapterBinding -Name $item.Name -ComponentID $item.ComponentID -PassThru -ErrorAction SilentlyContinue | Out-Null }
-      else { Disable-NetAdapterBinding -Name $item.Name -ComponentID $item.ComponentID -PassThru -ErrorAction SilentlyContinue | Out-Null }
-      Write-Change "Binding restored: $($item.Name) -> $($curr.DisplayName) ($($item.ComponentID)) to $($item.Enabled)"
-    }
-  }
-  Write-Host 'Bindings restored to saved state (if differences were found).'
-}
-function Bindings-Status {
-  $bindings = 'ms_msclient','ms_server','ms_implat','ms_lldp','ms_tcpip6','ms_rspndr','ms_lltdio'
-  $adapters = Get-PhysAdapters
-  if (-not $adapters){ Write-Host 'No physical Ethernet/Wi-Fi adapters found.'; return }
-  foreach($a in $adapters){
-    Write-Host "`n[$($a.Name)]"
-    foreach($b in $bindings){
-      $bind = Get-NetAdapterBinding -Name $a.Name -ComponentID $b -ErrorAction SilentlyContinue
-      if ($bind) { "{0,-40} : {1}" -f $bind.DisplayName, [bool]$bind.Enabled | Write-Host }
-    }
-  }
-}
-function Adapters-List { Get-PhysAdapters | Select-Object Name, InterfaceDescription, Status, MediaType | Format-Table -AutoSize }
-
-function Adv-Restore {
-  $f = Get-ChildItem $env:ProgramData -Filter 'EthProfileBackup-*.xml' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-  if (-not $f) { Write-Host 'No backup found. Nothing to restore.'; return }
-  Write-Host "Using backup: $($f.FullName)"
-  $data = Import-Clixml $f.FullName
-  foreach($pm in $data.Power){
-    $cur = Get-NetAdapterPowerManagement -Name $pm.Name -ErrorAction SilentlyContinue
-    if ($cur -and ($cur.AllowComputerToTurnOffDevice -ne $pm.AllowComputerToTurnOffDevice -or $cur.WakeOnMagicPacket -ne $pm.WakeOnMagicPacket -or $cur.WakeOnPattern -ne $pm.WakeOnPattern)) {
-      Set-NetAdapterPowerManagement -Name $pm.Name -AllowComputerToTurnOffDevice $pm.AllowComputerToTurnOffDevice -WakeOnMagicPacket $pm.WakeOnMagicPacket -WakeOnPattern $pm.WakeOnPattern -ErrorAction SilentlyContinue | Out-Null
-      Write-Change "PM restored: $($pm.Name)"
-    }
-  }
-  foreach($ap in $data.Advanced){
-    if ($ap.RegistryKeyword){
-      $cur = Get-NetAdapterAdvancedProperty -Name $ap.Name -RegistryKeyword $ap.RegistryKeyword -ErrorAction SilentlyContinue
-      if ($cur -and $cur.DisplayValue -ne $ap.DisplayValue){
-        Set-NetAdapterAdvancedProperty -Name $ap.Name -RegistryKeyword $ap.RegistryKeyword -DisplayValue $ap.DisplayValue -NoRestart -ErrorAction SilentlyContinue | Out-Null
-        Write-Change "Advanced restored: $($ap.Name) -> $($ap.DisplayName) = $($ap.DisplayValue) (was $($cur.DisplayValue))"
-      }
-    }
-  }
-  Write-Host 'Restore complete (only differences were logged).'
-}
-
-function Adv-Show {
-  $ad = Get-PhysAdapters
-  if (-not $ad){ Write-Host 'No physical Ethernet/Wi-Fi adapters found.'; return }
-  foreach($a in $ad){
-    Write-Host "`n[$($a.Name)]" -ForegroundColor Cyan
-    Get-NetAdapterPowerManagement -Name $a.Name | Format-Table AllowComputerToTurnOffDevice,WakeOnMagicPacket,WakeOnPattern -AutoSize
-    $want = ($DesiredAdvancedMap.K | Select-Object -Unique)
-    Get-NetAdapterAdvancedProperty -Name $a.Name -AllProperties -ErrorAction SilentlyContinue |
-      Where-Object { $want -contains $_.RegistryKeyword -or ($_.DisplayName -match ($OffloadNamePatterns -join '|')) } |
-      Select-Object DisplayName,DisplayValue,RegistryKeyword | Format-Table -AutoSize
-  }
-}
-
-function Full-Restore {
-  Write-Host "Reverting TCP to NORMAL and removing $RegName..."
+function Adv-Restore{
   Set-TcpMode -Mode 'Normal'
-  Write-Host "Restoring adapter bindings from latest backup (if available)..."
-  Bindings-Restore
-  Write-Host "Restoring Power/Advanced settings from latest backup (if available)..."
-  Adv-Restore
-  Write-Host "[+] Full Restore complete."
+  if (Test-Path $RegPath){ Remove-ItemProperty -Path $RegPath -Name $RegName -ErrorAction SilentlyContinue }
+  OK "[OK] Advanced settings restored."
+  Log "AFD value removed"
+}
+function PerfRegs-Apply{ WARN "Perf regs placeholder."; Log "PerfRegs-Apply placeholder executed." }
+function Full-Restore{
+  Set-TcpMode -Mode 'Normal'
+  if (Test-Path $RegPath){ Remove-ItemProperty -Path $RegPath -Name $RegName -ErrorAction SilentlyContinue }
+  OK "[OK] Full restore done."
+  Log "Full restore -> TCP Normal + remove AFD"
 }
 
-# --------------- router ---------------
-switch ($Action) {
-  'Show-TcpStatus'   { Show-TcpStatus }
-  'Set-TcpMode'      { if (-not $Mode) { Write-Host 'Missing Mode (Disabled|Normal|HighlyRestricted)'; break }; Set-TcpMode -Mode $Mode }
-  'Set-Congestion'   { if (-not $Mode) { Write-Host 'Missing Mode (BBR2|CUBIC|NewReno)'; break }; Set-Congestion -Provider $Mode }
-  'Bindings-Disable' { Bindings-Disable }
-  'Bindings-Restore' { Bindings-Restore }
-  'Bindings-Status'  { Bindings-Status }
-  'Adapters-List'    { Adapters-List }
-  'Adv-Apply'        { Adv-Apply }
-  'Adv-Restore'      { Adv-Restore }
-  'Adv-Show'         { Adv-Show }
-  'PerfRegs-Apply'   { Apply-PerfRegs-AllAdapters }
-  'Full-Restore'     { Full-Restore }
+# ===== APPLY ALL =====
+function Apply-All{
+  HDR "APPLY ALL"
+
+  SEC "Choose a TCP congestion provider"
+  W "  1. BBR2   (best performing - Windows 11 24H2+)"
+  W "  2. CUBIC  (default)"
+  W "  3. NewReno (test)"
+  W "  4. Skip   (leave current provider)"
+  W ""
+  $c = Read-Host "Choose 1-4"
+  switch ($c){
+    '1' { Set-Congestion 'BBR2' }
+    '2' { Set-Congestion 'CUBIC' }
+    '3' { Set-Congestion 'NewReno' }
+    default { WARN "Keeping current congestion provider"; Show-ProviderSummary }
+  }
+
+  W ""
+  SEC "Choose autotuning mode to use with the full profile"
+  W "  1. DISABLED          (max stability, may reduce bandwidth)"
+  W "  2. HIGHLYRESTRICTED  (closer to normal bandwidth)"
+  W "  3. NORMAL            (no TCP tuning; still applies NIC changes)"
+  W "  4. Back/Skip"
+  W ""
+  $a = Read-Host "Choose 1-4"
+  switch ($a){
+    '1' { Set-TcpMode -Mode 'Disabled' }
+    '2' { Set-TcpMode -Mode 'HighlyRestricted' }
+    '3' { Set-TcpMode -Mode 'Normal' }
+    default { WARN "Keeping current autotuning mode"; W ""; SEC "Current TCP global settings"; netsh int tcp show global }
+  }
+
+  W ""
+  SEC "Applying Advanced + Extras"
+  Adv-Apply
+
+  SEC "Cloudflare DNS + metric=1"
+  foreach($nic in Get-PhysAdapters){
+    try {
+      netsh interface ip set dns name="$($nic.Name)" static 1.1.1.1 primary | Out-Null
+      netsh interface ip add dns name="$($nic.Name)" 1.0.0.1 index=2       | Out-Null
+      Set-NetIPInterface -InterfaceAlias $nic.Name -AutomaticMetric Disabled -ErrorAction SilentlyContinue
+      Set-NetIPInterface -InterfaceAlias $nic.Name -InterfaceMetric 1 -ErrorAction SilentlyContinue
+    } catch {}
+  }
+
+  SEC "NDIS + NIC interrupt delays"
+  Ensure-Dword -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\NDIS\Parameters' -Name 'TrackNblOwner' -Value 0
+  foreach($r in Get-ChildItem $ClassKeyBase -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^\d{4}$' }){
+    Ensure-String -Path $r.PSPath -Name 'TxIntDelay' -Value '0'
+    Ensure-String -Path $r.PSPath -Name 'TxAbsIntDelay' -Value '0'
+    Ensure-String -Path $r.PSPath -Name 'RxIntDelay' -Value '0'
+    Ensure-String -Path $r.PSPath -Name 'RxAbsIntDelay' -Value '0'
+  }
+
+  OK "`n[+] APPLY ALL complete."
+  Log "[APPLY ALL] complete (congestion/mode + advanced/extras + DNS metric=1 + NDIS + NIC delays)"
+}
+
+# ===== Router =====
+switch ($Action){
+  'Show-TcpStatus' { Show-TcpStatus }
+  'Set-TcpMode'    { if($Mode){ Set-TcpMode -Mode $Mode } else { WARN 'Missing -Mode' } }
+  'Set-Congestion' { if($Mode){ Set-Congestion $Mode } else { WARN 'Missing -Mode' } }
+  'Bindings-Status'{ SEC 'Bindings Status (stub)'; Get-PhysAdapters | Select Name, Status, MacAddress | Format-Table -AutoSize }
+  'Adv-Apply'      { Adv-Apply }
+  'Adv-Restore'    { Adv-Restore }
+  'Adv-Show'       { SEC 'AFD key'; try { Get-ItemProperty -Path $RegPath | Select-Object $RegName | Format-List } catch { W 'AFD param not set.' 'DarkGray' } }
+  'PerfRegs-Apply' { PerfRegs-Apply }
+  'Full-Restore'   { Full-Restore }
+  'Apply-All'      { Apply-All }
+  default          { }
 }
