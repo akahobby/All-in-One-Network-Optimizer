@@ -32,6 +32,7 @@ It supports both Ethernet and Wi-Fi adapters, with a menu-driven interface and b
 - Always create a restore point before making major changes.
 - Some optimizations may require a reboot.
 - The script logs changes so you can review what was applied.
+- After applying tweaks, you can test your results with the [Waveform Bufferbloat Test](https://www.waveform.com/tools/bufferbloat).
 
 ---
 
