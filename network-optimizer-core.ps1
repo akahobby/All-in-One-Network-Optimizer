@@ -175,7 +175,7 @@ function Nic-Backup-All {
     $rows += [PSCustomObject]@{ Name=$n; Backup=$p }
   }
   $combo = Join-Path $BackupRoot ("NIC-ALL-{0}.json" -f $Stamp)
-  $rows | ConvertTo-Json -Depth 6 | Out-File -Encoding UTF8 $combo
+  $rows | Convert-ToJson -Depth 6 | Out-File -Encoding UTF8 $combo
   Write-Host ("Combined backup saved: {0}" -f $combo) -ForegroundColor DarkGray
   $combo
 }
@@ -238,13 +238,102 @@ function Set-NicBufferMax {
   @{Changed=$false;Value=$null}
 }
 
+# -------- DNS + adapter bindings (aggressive option) --------
+function Set-CloudflareDns([string]$nic) {
+  try {
+    $v4 = @('1.1.1.1','1.0.0.1')
+    $v6 = @('2606:4700:4700::1111','2606:4700:4700::1001')
+
+    # IPv4 via InterfaceIndex (more reliable)
+    $ip4 = Get-NetIPInterface -InterfaceAlias $nic -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($ip4) {
+      try {
+        Set-DnsClientServerAddress -InterfaceIndex $ip4.InterfaceIndex -ServerAddresses $v4 -ErrorAction Stop
+      } catch {
+        Set-DnsClientServerAddress -InterfaceIndex $ip4.InterfaceIndex -ResetServerAddresses -ErrorAction SilentlyContinue
+        Set-DnsClientServerAddress -InterfaceIndex $ip4.InterfaceIndex -ServerAddresses $v4 -ErrorAction Stop
+      }
+    }
+
+    # IPv6 only if binding enabled
+    $v6Enabled = $false
+    $b = Get-NetAdapterBinding -Name $nic -ComponentID 'ms_tcpip6' -ErrorAction SilentlyContinue
+    if ($b) { $v6Enabled = [bool]$b.Enabled }
+    if ($v6Enabled) {
+      $ip6 = Get-NetIPInterface -InterfaceAlias $nic -AddressFamily IPv6 -ErrorAction SilentlyContinue | Select-Object -First 1
+      if ($ip6) {
+        try {
+          Set-DnsClientServerAddress -InterfaceIndex $ip6.InterfaceIndex -ServerAddresses $v6 -ErrorAction Stop
+        } catch {
+          Set-DnsClientServerAddress -InterfaceIndex $ip6.InterfaceIndex -ResetServerAddresses -ErrorAction SilentlyContinue
+          Set-DnsClientServerAddress -InterfaceIndex $ip6.InterfaceIndex -ServerAddresses $v6 -ErrorAction Stop
+        }
+      }
+    }
+
+    $v6Text = if ($v6Enabled) { ($v6 -join '/') } else { 'skipped' }
+    Write-Host ("- DNS set to Cloudflare on '{0}' (v4: {1}; v6: {2})" -f $nic, ($v4 -join '/'), $v6Text) -ForegroundColor DarkGray
+  } catch {
+    Write-Host ("[i] DNS not changed on '{0}' (policy, VPN, or security suite may be enforcing DNS)." -f $nic) -ForegroundColor DarkGray
+  }
+}
+
+function Apply-AdapterBindings([string]$nic, [switch]$Aggressive) {
+  # Keep QoS + IPv4 enabled
+  foreach ($keep in @('ms_pacer','ms_tcpip')) {
+    try { Enable-NetAdapterBinding -Name $nic -ComponentID $keep -ErrorAction SilentlyContinue | Out-Null } catch {}
+  }
+
+  # Base items to disable
+  $disable = @('ms_lltdio','ms_rspndr','ms_lldp','ms_implat')  # LLTD Mapper/Responder, LLDP, Multiplexor
+
+  # IPv6 handling
+  $hasV6Default = Get-NetRoute -InterfaceAlias $nic -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue
+
+  if ($Aggressive) {
+    # Aggressive: leave only QoS + IPv4 (matches your older build)
+    $disable += 'ms_tcpip6','ms_msclient','ms_server'           # IPv6, Client for MS Networks, File & Printer Sharing
+  } else {
+    # Safe: disable IPv6 only if no default v6 route
+    if (-not $hasV6Default) { $disable += 'ms_tcpip6' }
+  }
+
+  $changed = @()
+  foreach ($comp in $disable) {
+    try {
+      $b = Get-NetAdapterBinding -Name $nic -ComponentID $comp -ErrorAction SilentlyContinue
+      if ($b -and $b.Enabled) {
+        Disable-NetAdapterBinding -Name $nic -ComponentID $comp -ErrorAction SilentlyContinue | Out-Null
+        $changed += $comp
+      }
+    } catch {}
+  }
+
+  if ($changed.Count -gt 0) {
+    Write-Host ("- Disabled bindings on '{0}': {1}" -f $nic, ($changed -join ', ')) -ForegroundColor DarkGray
+  } else {
+    Write-Host ("- No additional bindings disabled on '{0}'" -f $nic) -ForegroundColor DarkGray
+  }
+}
+
 # -------- NIC tweak sets (Option A: keep non-buffer tweaks) --------
 function Apply-CrossVendorTweaks([string]$nic){
   Write-Host "-- Applying cross-vendor tweaks (MTU, DNS, metrics, TrackNblOwner) --" -ForegroundColor Yellow
+
+  # Metric
   try { Set-NetIPInterface -InterfaceAlias $nic -AutomaticMetric Disabled -InterfaceMetric 1 -ErrorAction SilentlyContinue } catch {}
+
+  # Cloudflare DNS (v4 + v6 if enabled)
+  Set-CloudflareDns $nic
+
+  # Aggressive bindings (leave only QoS + IPv4)
+  Apply-AdapterBindings -nic $nic -Aggressive
+
+  # TrackNblOwner registry knob
   New-Item -Path "HKLM:\SYSTEM\CurrentControlSet\Services\NDIS\Parameters" -Force | Out-Null
   New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\NDIS\Parameters" -Name "TrackNblOwner" -PropertyType DWord -Value 0 -Force | Out-Null
 }
+
 function Apply-IntelTweaks([string]$nic){
   Write-Host ("-- Intel advanced tweaks for '{0}' --" -f $nic) -ForegroundColor Yellow
   $map=@(
@@ -292,7 +381,7 @@ function Apply-NicTweaks-Interactive {
     $hasBuf = [bool]($buf.RX -or $buf.TX)
     if (-not $hasBuf) { Write-Host "[Buffers not exposed by this driver - applying non-buffer tweaks only]" -ForegroundColor DarkGray }
 
-    # Cross-vendor tweaks
+    # Cross-vendor tweaks (includes DNS + aggressive bindings)
     Apply-CrossVendorTweaks $nic
 
     # Vendor-specific selection
